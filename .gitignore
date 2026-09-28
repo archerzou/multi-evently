@@ -1,0 +1,111 @@
+## =============================================================
+##  Evently — .gitignore (.NET + JetBrains Rider + Docker)
+## =============================================================
+
+## ---- Build output ----
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Dd]ebug/
+[Rr]elease/
+[Ll]og/
+[Ll]ogs/
+artifacts/
+
+## ---- .NET / MSBuild ----
+project.lock.json
+project.fragment.lock.json
+*.binlog
+*.nupkg
+*.snupkg
+*.user
+*.suo
+*.userprefs
+*_i.c
+*_p.c
+*.ilk
+*.meta
+*.obj
+*.iobj
+*.pch
+*.pdb
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*.vspscc
+*.vssscc
+.builds
+
+## ---- Test / coverage results ----
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+*.coveragexml
+.vs/
+
+## =============================================================
+##  IDE: JetBrains Rider / IntelliJ
+## =============================================================
+.idea/
+*.sln.iml
+*.DotSettings.user
+
+## Keep the shared team ReSharper/Rider settings under source control:
+!Evently.sln.DotSettings
+
+## =============================================================
+##  IDE: Visual Studio / VS Code
+## =============================================================
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.vsidx
+.vshistory/
+
+## =============================================================
+##  Secrets & local configuration  (DO NOT COMMIT)
+## =============================================================
+*.env
+.env.*
+!.env.example
+appsettings.*.local.json
+appsettings.Development.json
+secrets.json
+*.pfx
+*.key
+*.pem
+
+## =============================================================
+##  Docker (keep compose files; ignore local overrides)
+## =============================================================
+docker-compose.override.local.yml
+.docker/
+
+## =============================================================
+##  OS junk
+## =============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+## =============================================================
+##  NuGet
+## =============================================================
+*.nuget.props
+*.nuget.targets
+.nuget/
+packages/
+!**/packages/build/
