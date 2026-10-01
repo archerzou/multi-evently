@@ -1,10 +1,13 @@
 # Event-Driven Patterns in Evently
 
-A deep dive into the three event-driven patterns used in this modular monolith, grounded in the actual code:
+A deep dive into the event-driven patterns used in this modular monolith, grounded in the actual code:
 
 1. **Event Notification** — Orders (`Ticketing` module)
 2. **Event-Carried State Transfer (ECST)** — Users → Attendance
 3. **Materialized View + CQRS** — `EventStatistics` (`Attendance` module)
+4. **Saga (orchestration)** — `CancelEventSaga` (`Events` module, coordinating Events ↔ Ticketing)
+
+> Patterns 1–3 are about **how a single event moves data**. Pattern 4 is a different category: it is about **coordinating a multi-step workflow that spans modules** and keeping its state durable from start to finish.
 
 The application (see `docs/structure.png`) is a **modular monolith**: four independently-schemad modules — `Events`, `Ticketing`, `Attendance`, `Users` — each owning its own PostgreSQL schema (`events.*`, `ticketing.*`, `attendance.*`, `users.*`), talking to each other **only through a message broker** (RabbitMQ via MassTransit). No module reaches into another module's tables.
 
@@ -301,6 +304,146 @@ flowchart TD
 
 ---
 
+## Pattern 4 — Saga / Process Manager (CancelEventSaga)
+
+> "A long-running, stateful coordinator that drives a multi-step workflow across modules to a definite end — and remembers where it is even if the process restarts."
+
+### Definition
+A **saga** (here implemented as an **orchestration-based** state machine, a.k.a. a *process manager*) is a durable object that **reacts to events, keeps state, and emits commands/events** until a business process completes. Where patterns 1–3 each describe *one hop* of an event, a saga stitches *many hops across several modules* into a single coordinated transaction that cannot be done in one ACID database transaction (the steps live in different schemas / different modules).
+
+Canceling an event is exactly such a process: it must (a) cancel the event, (b) **refund all payments**, and (c) **archive all tickets** — work that is split between the `Events` module and the `Ticketing` module. No single DB transaction can span both. The saga guarantees all steps eventually run and that the process only finishes when **both** refund and archive have completed.
+
+This is the one place in Evently that uses **orchestration**; everything else is **choreography** (each handler independently reacts, nobody is "in charge"). The contrast is the key lesson of this section.
+
+### The state machine
+Your diagram maps 1:1 onto the MassTransit state machine in `Events.Presentation/Events/CancelEventSaga/`:
+
+![CancelEvent saga state machine](./saga_pattern.png)
+
+```csharp
+// CancelEventSaga.cs — a MassTransitStateMachine<CancelEventState>
+public State CancellationStarted { get; private set; }
+public State PaymentsRefunded { get; private set; }
+public State TicketsArchived { get; private set; }
+
+public Event<EventCanceledIntegrationEvent> EventCanceled { get; private set; }
+public Event<EventPaymentsRefundedIntegrationEvent> EventPaymentsRefunded { get; private set; }
+public Event<EventTicketsArchivedIntegrationEvent> EventTicketsArchived { get; private set; }
+public Event EventCancellationCompleted { get; private set; }   // ← composite (join) event
+```
+
+The persisted state is deliberately tiny — the saga is identified by the **EventId** and remembers only which state it is in and how far the join has progressed:
+
+```csharp
+// CancelEventState.cs
+public sealed class CancelEventState : SagaStateMachineInstance, ISagaVersion
+{
+    public Guid CorrelationId { get; set; }          // == EventId (see CorrelateById below)
+    public int Version { get; set; }                 // optimistic concurrency (ISagaVersion)
+    public string CurrentState { get; set; }         // "CancellationStarted" / "PaymentsRefunded" / ...
+    public int CancellationCompletedStatus { get; set; }  // bit-flags tracking the CompositeEvent
+}
+```
+
+### Correlation, persistence & registration
+- **Correlation** — every event in the flow is routed to the *same* saga instance by `EventId`:
+  ```csharp
+  Event(() => EventCanceled,          c => c.CorrelateById(m => m.Message.EventId));
+  Event(() => EventPaymentsRefunded,  c => c.CorrelateById(m => m.Message.EventId));
+  Event(() => EventTicketsArchived,   c => c.CorrelateById(m => m.Message.EventId));
+  ```
+  That is why `RefundPaymentsForEventCommandHandler`/`ArchiveTicketsForEventCommandHandler` publish their integration events with `EventId` as the correlation id — so MassTransit can find the right in-flight saga.
+- **Persistence** — the saga is stored in **Redis**, not Postgres, and wired up only in the `Events` module:
+  ```csharp
+  // EventsModule.cs
+  public static Action<IRegistrationConfigurator> ConfigureConsumers(string redisConnectionString) =>
+      cfg => cfg.AddSagaStateMachine<CancelEventSaga, CancelEventState>()
+                .RedisRepository(redisConnectionString);
+  ```
+  (Registered in `Program.cs` via `EventsModule.ConfigureConsumers(redisConnectionString)`.) Because state is external and durable, the process survives a restart mid-cancellation — the defining property of a saga versus a plain fan-out.
+- **Optimistic concurrency** — `ISagaVersion.Version` guards against two events mutating the same instance concurrently (e.g. refund and archive completing at the same instant).
+
+### Trigger & end-to-end workflow
+```
+Admin → CancelEvent endpoint
+  │  Events: CancelEventCommandHandler → event.Cancel() → EventCanceledDomainEvent
+  │  EventCanceledDomainEventHandler → publish EventCanceledIntegrationEvent
+  ▼
+┌─ SAGA starts (Initially / When EventCanceled) ──────────────────────────────┐
+│  • publish EventCancellationStartedIntegrationEvent                          │
+│  • TransitionTo(CancellationStarted)                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+  │
+  ▼  (Ticketing reacts to EventCancellationStarted)
+  Ticketing: EventCancellationStartedIntegrationEventHandler → CancelEventCommand
+             → event.Cancel() → EventCanceledDomainEvent (Ticketing's own)
+             ├─ RefundPaymentsEventCanceledDomainEventHandler → RefundPaymentsForEventCommand
+             │     → payments.Refund(); event.PaymentsRefunded() → EventPaymentsRefundedDomainEvent
+             │     → publish EventPaymentsRefundedIntegrationEvent  ───────────┐
+             └─ ArchiveTicketsEventCanceledDomainEventHandler → ArchiveTicketsForEventCommand
+                   → tickets.Archive(); event.TicketsArchived() → EventTicketsArchivedDomainEvent
+                   → publish EventTicketsArchivedIntegrationEvent  ────────────┤
+  │                                                                            │
+  ▼  (both integration events flow back to the SAME saga, correlated by EventId)
+┌─ SAGA collects (order-independent) ───────────────────────────────────────────┐
+│  During(CancellationStarted): whichever arrives first → PaymentsRefunded       │
+│                                                     or → TicketsArchived        │
+│  During(PaymentsRefunded):  When(EventTicketsArchived) → TicketsArchived        │
+│  During(TicketsArchived):   When(EventPaymentsRefunded) → PaymentsRefunded      │
+│                                                                                 │
+│  CompositeEvent(EventCancellationCompleted = PaymentsRefunded ∧ TicketsArchived)│
+│  DuringAny(When EventCancellationCompleted):                                     │
+│     • publish EventCancellationCompletedIntegrationEvent                         │
+│     • Finalize()   → saga instance removed from Redis                            │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The crucial detail is the **fork-join / barrier**. Refund and archive run **in parallel** and may finish in **either order**. The `During(...)` blocks accept both orderings (the "X" cross-transitions in your diagram), and the `CompositeEvent` only raises `EventCancellationCompleted` once **both** flags are set:
+
+```csharp
+CompositeEvent(
+    () => EventCancellationCompleted,
+    state => state.CancellationCompletedStatus,   // bit-field persisted across messages
+    EventPaymentsRefunded, EventTicketsArchived); // fires only when BOTH have been seen
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> CancellationStarted: EventCanceled / publish EventCancellationStarted
+    CancellationStarted --> PaymentsRefunded: EventPaymentsRefunded
+    CancellationStarted --> TicketsArchived: EventTicketsArchived
+    PaymentsRefunded --> TicketsArchived: EventTicketsArchived
+    TicketsArchived --> PaymentsRefunded: EventPaymentsRefunded
+    PaymentsRefunded --> [*]: EventCancellationCompleted / publish EventCancellationCompleted + Finalize
+    TicketsArchived --> [*]: EventCancellationCompleted / publish EventCancellationCompleted + Finalize
+```
+
+### Who publishes / consumes what
+
+| Step | Owner module | Message | Kind |
+|------|--------------|---------|------|
+| Start | Events | `EventCanceledIntegrationEvent` | triggers saga |
+| Saga → work | Events (saga) | `EventCancellationStartedIntegrationEvent` | command-ish event |
+| Refund done | Ticketing | `EventPaymentsRefundedIntegrationEvent` | reply to saga |
+| Archive done | Ticketing | `EventTicketsArchivedIntegrationEvent` | reply to saga |
+| Finished | Events (saga) | `EventCancellationCompletedIntegrationEvent` | terminal broadcast |
+
+Note `EventCancellationCompletedIntegrationEvent` currently has **no consumer** — it is a deliberate extension point (e.g. notify attendees, update a dashboard) emitted when the process reaches `Final`.
+
+### Why a saga here (and not plain choreography)
+- **Cross-module atomicity without a distributed transaction.** Refund (Ticketing payments) and archive (Ticketing tickets) plus the event cancellation (Events) cannot share one ACID transaction. The saga provides *eventual* atomicity: it won't declare "completed" until every step has.
+- **A join/barrier is needed.** Pure choreography can fan work out, but "do Z only after *both* X and Y finish" needs someone holding state. The `CompositeEvent` is that barrier — impossible to express cleanly with stateless handlers.
+- **Durability across time and restarts.** A cancellation may take seconds to minutes (payment gateway latency, many tickets). Redis-backed state means an app restart resumes exactly where it left off.
+- **Observability / single source of truth.** `CurrentState` makes "where is this cancellation?" a single lookup, which is invaluable operationally.
+
+### Trade-offs & notes
+- **Orchestration adds a central brain.** The saga now *knows* about the Events and Ticketing contracts. That is a coupling you accept in exchange for coordination — keep it thin (it only routes events and tracks state, no business rules).
+- **No compensation in this implementation.** A textbook saga also defines **compensating actions** (undo steps if a later step fails). `CancelEventSaga` models the happy-path fork-join and completion barrier; it does not roll back a refund if archiving fails. If archiving could fail permanently, you would add a failure event + compensation transition. Worth flagging as the main gap.
+- **At-least-once + idempotency still apply.** The same inbox/outbox/idempotency spine protects the saga's inputs; MassTransit + `ISagaVersion` protect its state transitions.
+- **Placement.** The saga lives in `Events.Presentation` (the module that "owns" the event lifecycle) even though it commands Ticketing — a reasonable ownership choice since cancellation is an Events-domain concept.
+
+---
+
 ## The two headline scenarios end-to-end
 
 The three patterns are not alternatives — in Evently they **compose** in a single user journey.
@@ -362,9 +505,24 @@ Why each pattern fits *this* moment:
 | Cost | Chatty (N callbacks) | Duplication + versioning | Extra tables + projection handlers |
 | Where in code | `Ticketing.Application/Orders/CreateOrder/*` | `Users.IntegrationEvents/*` + `Attendance.Presentation/Attendees/*` | `Attendance.Application/EventStatistics/*` |
 
+### Where the Saga fits
+
+The saga is **orthogonal** to patterns 1–3 — it is not another way to move one event, but a coordinator built *on top of* them:
+
+| Aspect | Patterns 1–3 (Notification / ECST / CQRS) | Saga (CancelEventSaga) |
+|--------|-------------------------------------------|------------------------|
+| Concern | Move/replicate/read data for **one** event | Coordinate a **multi-step** workflow |
+| Style | **Choreography** — nobody is in charge | **Orchestration** — a central state machine |
+| State | Stateless handlers | **Durable state** (Redis, `CancelEventState`) |
+| Lifespan | A single message handling | Long-running, survives restarts |
+| Correlation | — | By `EventId` across many messages |
+| Completion | Implicit (handler returns) | Explicit (`CompositeEvent` barrier → `Finalize`) |
+| Use when | Independent reactions suffice | Steps must converge / "do Z after both X and Y" |
+
 **One-line mental model:**
 - *Notification* = "call me back for details."
 - *ECST* = "here's a copy, keep it."
 - *Materialized view / CQRS* = "I already did the math; just read it."
+- *Saga* = "I'll drive this multi-step job across modules and tell you when it's all done."
 
-All three sit on the same reliable spine — **Outbox → broker → Inbox**, with idempotent handlers — which is what lets a modular monolith behave like cooperating services without giving up transactional integrity inside each module.
+All of these sit on the same reliable spine — **Outbox → broker → Inbox**, with idempotent handlers — which is what lets a modular monolith behave like cooperating services without giving up transactional integrity inside each module. The saga adds one more ingredient on top of that spine: **durable, correlated state**, turning a scatter of independent events into a coordinated, resumable business transaction.
